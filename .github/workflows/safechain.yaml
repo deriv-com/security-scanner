@@ -1,0 +1,201 @@
+name: Safe-Chain Dependency Protection
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label for the scan job.
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      timeout-minutes:
+        description: Hard timeout for the scan job.
+        required: false
+        type: number
+        default: 15
+    outputs:
+      node-detected:
+        description: "true if a Node.js manifest was found and scanned."
+        value: ${{ jobs.scan.outputs.node-detected }}
+      python-detected:
+        description: "true if a Python manifest was found and scanned."
+        value: ${{ jobs.scan.outputs.python-detected }}
+
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: safe-chain-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Safe-Chain scan
+    runs-on: ${{ inputs.runs-on || 'ubuntu-latest' }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout-minutes || '15') }}
+    permissions:
+      contents: read
+    outputs:
+      node-detected: ${{ steps.detect.outputs.has_node }}
+      python-detected: ${{ steps.detect.outputs.has_python }}
+      discovered-paths: ${{ steps.detect.outputs.target_paths }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Auto-Discover Package Manifests
+        id: detect
+        run: |
+          set -euo pipefail
+          echo "Starting intelligent filesystem auto-discovery..."
+
+          # Dynamic Search: Find unique paths up to 2 directories deep containing manifests
+          discovered_paths=$(find . -maxdepth 2 \( \
+            -name "package-lock.json" -o \
+            -name "yarn.lock" -o \
+            -name "pnpm-lock.yaml" -o \
+            -name "bun.lockb" -o \
+            -name "bun.lock" -o \
+            -name "poetry.lock" -o \
+            -name "uv.lock" -o \
+            -name "requirements.txt" -o \
+            -name "pyproject.toml" \
+          \) -exec dirname {} \; | sort -u | sed 's|^\./||')
+
+          has_node=false
+          has_python=false
+
+          if [[ -z "$discovered_paths" ]]; then
+            echo "::warning::No language manifests found anywhere in this repository. Skipping scan."
+            discovered_paths="."
+          else
+            while IFS= read -r dir || [[ -n "$dir" ]]; do
+              [[ -z "$dir" ]] && continue
+              echo "Analyzing discovered path: $dir"
+              if [[ -f "$dir/package-lock.json" || -f "$dir/yarn.lock" || -f "$dir/pnpm-lock.yaml" || -f "$dir/bun.lockb" || -f "$dir/bun.lock" ]]; then
+                has_node=true
+                echo "  -> Node.js engine required"
+              fi
+              if [[ -f "$dir/poetry.lock" || -f "$dir/uv.lock" || -f "$dir/requirements.txt" || -f "$dir/pyproject.toml" ]]; then
+                has_python=true
+                echo "  -> Python engine required"
+              fi
+            done <<< "$discovered_paths"
+          fi
+
+          paths_delim="SAFECHAIN_TARGET_PATHS_EOF"
+          {
+            echo "has_node=$has_node"
+            echo "has_python=$has_python"
+            echo "target_paths<<$paths_delim"
+            printf '%s\n' "$discovered_paths"
+            echo "$paths_delim"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.has_node == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Python
+        if: steps.detect.outputs.has_node == 'true' || steps.detect.outputs.has_python == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Bootstrap Safe-Chain (verified)
+        if: steps.detect.outputs.has_node == 'true' || steps.detect.outputs.has_python == 'true'
+        run: |
+          set -euo pipefail
+          url="https://github.com/AikidoSec/safe-chain/releases/download/1.5.3/install-safe-chain.sh"
+          script_file="$(mktemp)"
+          trap 'rm -f "$script_file"' EXIT
+
+          echo "Downloading Safe-Chain installer..."
+          curl -fsSL --retry 5 --retry-delay 5 --max-time 60 "$url" -o "$script_file"
+
+          echo "Verifying installer checksum..."
+          actual_sha="$(sha256sum "$script_file" | awk '{print $1}')"
+          if [[ "$actual_sha" != "0107cbbbf90159379756157e902acae512d62ffbd174307e42c5fe9f266792d3" ]]; then
+            echo "::error::Safe-Chain validation failed."
+            exit 1
+          fi
+
+          sh "$script_file" --ci
+          echo "$HOME/.safe-chain/shims" >> "$GITHUB_PATH"
+          echo "$HOME/.safe-chain/bin"   >> "$GITHUB_PATH"
+
+      - name: Execute guarded installation
+        if: steps.detect.outputs.has_node == 'true' || steps.detect.outputs.has_python == 'true'
+        env:
+          TARGET_DIRS: ${{ steps.detect.outputs.target_paths }}
+          HAS_NODE: ${{ steps.detect.outputs.has_node }}
+          HAS_PYTHON: ${{ steps.detect.outputs.has_python }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.safe-chain/shims:$HOME/.safe-chain/bin:$PATH"
+
+          echo "Safe-Chain interception layer validation:"
+          safe-chain --version
+
+          # Newline-delimited dirs (IFS-safe for paths containing spaces)
+          while IFS= read -r dir || [[ -n "$dir" ]]; do
+            [[ -z "$dir" ]] && continue
+            if [[ "$dir" == "." && "$HAS_NODE" == "false" && "$HAS_PYTHON" == "false" ]]; then
+              continue
+            fi
+
+            echo "------------------------------------------------"
+            echo "Running guarded installations inside: $dir"
+            echo "------------------------------------------------"
+            
+            (
+              cd "$dir"
+              
+              # --- Node.js Ecosystem ---
+              if [[ -f package-lock.json ]]; then
+                echo "Installing with npm..."
+                npm ci || npm ci --legacy-peer-deps
+              elif [[ -f pnpm-lock.yaml ]]; then
+                echo "Installing with pnpm..."
+                corepack enable && pnpm install --frozen-lockfile
+              elif [[ -f yarn.lock ]]; then
+                echo "Installing with yarn..."
+                corepack enable
+                if grep -q '"packageManager": *"yarn@[2-9]' package.json 2>/dev/null; then
+                  yarn install --immutable
+                else
+                  yarn install --frozen-lockfile
+                fi
+              elif [[ -f bun.lockb || -f bun.lock ]]; then
+                echo "Installing with bun..."
+                npm install -g bun && bun install --frozen-lockfile
+              fi
+
+              # --- Python Ecosystem ---
+              if [[ -f poetry.lock ]]; then
+                echo "Installing with poetry..."
+                pip install --no-cache-dir poetry && poetry install --no-interaction --no-root
+              elif [[ -f uv.lock ]]; then
+                echo "Installing with uv..."
+                pip install --no-cache-dir uv && uv sync --frozen
+              elif [[ -f requirements.txt ]]; then
+                echo "Installing with pip..."
+                pip install --no-cache-dir -r requirements.txt
+              elif [[ -f pyproject.toml ]]; then
+                echo "Installing with pip (PEP 517)..."
+                pip install --no-cache-dir .
+              fi
+            )
+          done <<< "$TARGET_DIRS"
