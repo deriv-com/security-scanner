@@ -34,7 +34,7 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
-        uses: anthropics/claude-code-action@6ee201f0231fbb762d22664f12aad2e7ae0401ae
+        uses: anthropics/claude-code-action@536f2c32a39763739000b0e1ac69ca2647d97ce9
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           track_progress: true            # use the action's sticky comment
