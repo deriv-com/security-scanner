@@ -44,7 +44,38 @@ jobs:
           persist-credentials: false
 
       # -----------------------------------------------------------------
-      # 2. Trivy — Full report (always runs, saved as artifact)
+      # 2. Install Trivy from GitHub releases
+      # setup-trivy downloads the binary from get.trivy.dev. That host
+      # does not resolve, so install.sh exits 6 (curl could not resolve
+      # host) before the scan starts. The release assets on GitHub are
+      # intact. The Linux x64 tarball checksum is pinned below.
+      # -----------------------------------------------------------------
+      - name: Install Trivy from GitHub releases
+        shell: bash
+        env:
+          TRIVY_VERSION: v0.70.0
+          # sha256 of trivy_0.70.0_Linux-64bit.tar.gz
+          TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+        run: |
+          set -euo pipefail
+          version="${TRIVY_VERSION#v}"
+          asset="trivy_${version}_Linux-64bit.tar.gz"
+          base="https://github.com/aquasecurity/trivy/releases/download/${TRIVY_VERSION}"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "${tmp}"' EXIT
+          curl -fsSL --retry 3 --retry-delay 2 -o "${tmp}/${asset}" "${base}/${asset}"
+          (
+            cd "${tmp}"
+            echo "${TRIVY_SHA256}  ${asset}" | sha256sum -c -
+            tar --no-same-owner -xzf "${asset}"
+          )
+          install -d "${HOME}/.local/bin"
+          install "${tmp}/trivy" "${HOME}/.local/bin/trivy"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          "${HOME}/.local/bin/trivy" --version
+
+      # -----------------------------------------------------------------
+      # 3. Trivy — Full report (always runs, saved as artifact)
       # -----------------------------------------------------------------
       - name: Trivy SCA full report
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 — VERIFIED SAFE
@@ -56,9 +87,11 @@ jobs:
           severity: 'CRITICAL,HIGH,MEDIUM'
           vuln-type: 'library'
           scanners: 'vuln'
+          skip-setup-trivy: true
+          version: v0.70.0
 
       # -----------------------------------------------------------------
-      # 3. Print results in job log for quick review
+      # 4. Print results in job log for quick review
       # -----------------------------------------------------------------
       - name: Display Trivy results
         if: always()
@@ -73,7 +106,7 @@ jobs:
           fi
 
       # -----------------------------------------------------------------
-      # 4. Upload results as workflow artifact (downloadable for 90 days)
+      # 5. Upload results as workflow artifact (downloadable for 90 days)
       # -----------------------------------------------------------------
       - name: Upload Trivy report
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -84,7 +117,7 @@ jobs:
           retention-days: 90
 
       # -----------------------------------------------------------------
-      # 5. Trivy — Gate (blocks the PR on CRITICAL / HIGH)
+      # 6. Trivy — Gate (blocks the PR on CRITICAL / HIGH)
       # -----------------------------------------------------------------
       - name: Trivy SCA gate
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 — VERIFIED SAFE
@@ -97,3 +130,5 @@ jobs:
           vuln-type: 'library'              # ← SCA only (dependency vulns)
           ignore-unfixed: true              # ← Skip vulns with no available fix
           scanners: 'vuln'                  # ← Vulnerability scanner only
+          skip-setup-trivy: true
+          version: v0.70.0
